@@ -5,15 +5,17 @@ import os.path
 import sys
 import json
 import datetime
+import time
 import re
 import requests
 import urllib
 from pathlib import Path
 import xbmc
+import xbmcvfs
 import xbmcaddon
 import xbmcgui
 import xbmcplugin
-import xml.etree.ElementTree as ET
+
  
 addon       = xbmcaddon.Addon()
 addonname   = addon.getAddonInfo('name')
@@ -49,10 +51,9 @@ else:
     CONFIG['music_videos'] = {}
 
 def __save():
-    with open(addon_path+'//config.json', 'w', encoding='utf-8') as f:
-        json.dump(CONFIG, f, ensure_ascii=False, indent=4)    
-
-
+    with open(addon_path+'//config.json', mode='w', encoding='UTF-8', errors='strict', buffering=1) as file:
+        file.write(json.dumps(CONFIG, sort_keys=True, indent=4, separators=(',', ': ')))
+        file.close()
 
 def __print(what):
     xbmcgui.Dialog().ok(addonname, what)
@@ -100,7 +101,7 @@ def __add_channel(channel_id):
     data['fanart'] = reply['items'][0]['brandingSettings']['image']['bannerTvHighImageUrl']
     uploads = reply['items'][0]['contentDetails']['relatedPlaylists']['uploads']
     data['uploader_stripped'] = re.sub(r'[^\w\s]', '', data['title']).replace(" ", "_")
-    Path(CHANNELS+'\\'+re.sub(r'[^\w\s]', '', data['title'])).mkdir(parents=True, exist_ok=True)
+    xbmcvfs.mkdirs(CHANNELS+'\\'+re.sub(r'[^\w\s]', '', data['title']))
     if channel_id not in CONFIG['channels']:
         CONFIG['channels'][channel_id] = {}
         CONFIG['channels'][channel_id]['channel_name'] = data['title']
@@ -193,6 +194,7 @@ def __check_if_youtube_addon_has_api_key():
                 return yt_api_key
     except RuntimeError:
         return None
+
 
 def __start_up():
     API_KEY = addon.getSetting('API_key')
@@ -336,6 +338,7 @@ def __render():
 
 
 def __refresh():
+    xbmcgui.Dialog().notification(addonname, 'Updating channels', xbmcgui.NOTIFICATION_INFO, 5000)
     for items in CONFIG['channels']:
         VIDEOS.clear()
         VIDEO_DURATION.clear()
@@ -344,6 +347,9 @@ def __refresh():
             __parse_uploads(CONFIG['channels'][items]['playlist_id'],CONFIG['channels'][items]['last_page'],update=True)
         else:
             __parse_uploads(CONFIG['channels'][items]['playlist_id'],None, update=True)
+    CONFIG['last_scan'] = int(time.time())
+    __save()
+    xbmcgui.Dialog().notification(addonname, 'Update finished', xbmcgui.NOTIFICATION_INFO, 5000)
 
 
 
@@ -379,6 +385,7 @@ def __menu(*args):
     elif menuItems[ret] == 'List Channels':
         __folders()
     elif menuItems[ret] == 'Refresh':
+        LOCAL_CONF['update'] = False
         __refresh()
 
 
@@ -390,5 +397,7 @@ if mode is None:
     __menu()
 elif mode[0] == 'AddItem':
     __add_channel(args['foldername'][0])
+elif mode[0] == 'Refresh':
+    __refresh()
 
 
