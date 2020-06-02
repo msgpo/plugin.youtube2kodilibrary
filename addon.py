@@ -1,7 +1,6 @@
 """ 
 YOUTUBE CHANNELS TO KODI
 """
-import os.path
 import sys
 import json
 import datetime
@@ -9,17 +8,17 @@ import time
 import re
 import requests
 import urllib
-from pathlib import Path
 import xbmc
 import xbmcvfs
 import xbmcaddon
 import xbmcgui
 import xbmcplugin
-
+import shutil
  
 addon       = xbmcaddon.Addon()
 addonname   = addon.getAddonInfo('name')
 addonID       = addon.getAddonInfo('id')
+addon_resources = addon.getAddonInfo("path") + '/resources/'
 addon_path = xbmc.translatePath("special://profile/addon_data/"+addonID)
 base_url = sys.argv[0]
 addon_handle = int(sys.argv[1])
@@ -40,9 +39,13 @@ LOCAL_CONF = {'update':False}
 def __build_url(query):
     return base_url + '?' + urllib.parse.urlencode(query)
 
+def convert(n): 
+    return str(datetime.timedelta(seconds = n)) 
+
 CONFIG={}
-if os.path.isfile(addon_path+'//config.json'):
-    with open(addon_path+'//config.json', 'r') as f:
+config_file=addon_path+'\\config.json'
+if xbmcvfs.exists(config_file):
+    with open(config_file, 'r') as f:
         CONFIG = json.load(f)
 else:
     CONFIG = {}
@@ -81,7 +84,7 @@ def __check_key_validity(key):
     return 'invalid'
 
 
-def __add_channel(channel_id):
+def __add_channel(channel_id,refresh=None):
     data = {}
     channel_url = "https://www.googleapis.com/youtube/v3/channels?part=brandingSettings,contentDetails,contentOwnerDetails,id,localizations,snippet,statistics,status,topicDetails&id="+channel_id+"&key="+addon.getSetting('API_key')
     req = requests.get(channel_url)
@@ -94,7 +97,6 @@ def __add_channel(channel_id):
         data['plot'] = reply['items'][0]['brandingSettings']['channel']['description']
     else:
         data['plot'] = data['title']
-    
     data['aired'] = reply['items'][0]['snippet']['publishedAt']
     data['thumb'] = reply['items'][0]['snippet']['thumbnails']['high']['url']
     data['banner'] = reply['items'][0]['brandingSettings']['image']['bannerImageUrl']
@@ -104,9 +106,14 @@ def __add_channel(channel_id):
     xbmcvfs.mkdirs(CHANNELS+'\\'+re.sub(r'[^\w\s]', '', data['title']))
     if channel_id not in CONFIG['channels']:
         CONFIG['channels'][channel_id] = {}
-        CONFIG['channels'][channel_id]['channel_name'] = data['title']
-        CONFIG['channels'][channel_id]['channel_type'] = 'series' #temporarily until music videos and movies are implemented
-        CONFIG['channels'][channel_id]['playlist_id'] = uploads
+    CONFIG['channels'][channel_id]['channel_name'] = data['title']
+    CONFIG['channels'][channel_id]['channel_type'] = 'series' #temporarily until music videos and movies are implemented
+    CONFIG['channels'][channel_id]['branding'] = {}
+    CONFIG['channels'][channel_id]['branding']['thumbnail'] = data['thumb']
+    CONFIG['channels'][channel_id]['branding']['fanart'] = data['fanart']
+    CONFIG['channels'][channel_id]['branding']['banner'] = data['banner']
+    CONFIG['channels'][channel_id]['branding']['description'] = data['plot']
+    CONFIG['channels'][channel_id]['playlist_id'] = uploads
     output = """
 <?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n
     <tvshow>
@@ -131,19 +138,29 @@ def __add_channel(channel_id):
     file.write(output)
     file.close()
     __save()
-    if 'last_page' in CONFIG['channels'][channel_id]:
-        __parse_uploads(uploads,CONFIG['channels'][channel_id]['last_page'])
-    else:
-        __parse_uploads(uploads,None)
+    __parse_uploads(True,uploads,None)
 
-def __parse_uploads(playlist_id, page_token=None, update=False):
-    if page_token:
+def __parse_uploads(fullscan, playlist_id, page_token=None, update=False):
+    if page_token and fullscan:
         url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId="+playlist_id+"&pageToken="+page_token+"&key="+addon.getSetting('API_key')
     else:
         url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId="+playlist_id+"&key="+addon.getSetting('API_key')
     req = requests.get(url)
     reply = json.loads(req.content)
     vid = []
+    try:
+        if 'error' in reply:
+            e_reason=reply['error']['errors'][0]['reason']
+            e_message=reply['error']['errors'][0]['message']
+            if e_reason == 'quotaExceeded':
+                e_message = "The request cannot be completed because you have exceeded your quota."
+            xbmcgui.Dialog().notification(addonname, e_message, xbmcgui.NOTIFICATION_ERROR, 10000)
+            __logger(e_message)
+            if len(VIDEOS) >= 1:
+                __render()
+            raise SystemExit(" error: quota exceeded")
+    except NameError:
+        pass
     totalResults=int(reply['pageInfo']['totalResults'])
     if LOCAL_CONF['update'] == False:
         PDIALOG.create('Fetching channel info', 'Please wait...')        
@@ -153,9 +170,9 @@ def __parse_uploads(playlist_id, page_token=None, update=False):
             PDIALOG.update(int(100 * len(VIDEOS) / totalResults), 'Downloading info: ' + str(len(VIDEOS)) + '/' + str(totalResults) )
         vid.append(item['snippet']['resourceId']['videoId'])
     __get_video_details(vid)
-    if reply.get('nextPageToken'):
+    if reply.get('nextPageToken') and fullscan:
         CONFIG['channels'][reply['items'][0]['snippet']['channelId']]['last_page'] = reply['nextPageToken']
-        __parse_uploads(playlist_id, reply['nextPageToken'])
+        __parse_uploads(True, playlist_id, reply['nextPageToken'])
     else:
         __render()
 
@@ -165,6 +182,19 @@ def __get_video_details(array):
     url = "https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id="+get+"&key="+addon.getSetting('API_key')
     req = requests.get(url)
     reply = json.loads(req.content)
+    try:
+        if 'error' in reply:
+            e_reason=reply['error']['errors'][0]['reason']
+            e_message=reply['error']['errors'][0]['message']
+            if e_reason == 'quotaExceeded':
+                e_message = "The request cannot be completed because you have exceeded your quota."
+            xbmcgui.Dialog().notification(addonname, e_message, xbmcgui.NOTIFICATION_ERROR, 10000)
+            __logger(e_message)
+            if len(VIDEOS) >= 1:
+                __render()
+            raise SystemExit(" error: quota exceeded")
+    except NameError:
+        pass    
     for item in reply['items']:
         VIDEO_DURATION[item['id']] = __yt_duration(item['contentDetails']['duration'])
 
@@ -229,11 +259,21 @@ def __search(query):
     channel_url = "https://www.googleapis.com/youtube/v3/search?type=channel&part=id,snippet&maxResults=50&q="+query+"&key="+addon.getSetting('API_key')
     req = requests.get(channel_url)
     reply = json.loads(req.content)
+    try:
+        if 'error' in reply:
+            e_reason=reply['error']['errors'][0]['reason']
+            e_message=reply['error']['errors'][0]['message']
+            if e_reason == 'quotaExceeded':
+                e_message = "The request cannot be completed because you have exceeded your quota."
+            __print(e_message)
+            raise SystemExit(" error")
+    except NameError:
+        pass    
     if not 'items' in reply:
         __print('No such channel')
         raise SystemExit(" error")
     ###########################
-    # No idea why the first(0) item not showing on results, hack till i do
+    # No idea why the first(0) item not always showing on results, hack till i do
     ###########################
     SEARCH_QUERY[reply['items'][0]['snippet']['title']+' '] = {}
     SEARCH_QUERY[reply['items'][0]['snippet']['title']+' ']['id'] = reply['items'][0]['snippet']['channelId']
@@ -245,7 +285,7 @@ def __search(query):
         SEARCH_QUERY[item['snippet']['title']]['id'] = item['snippet']['channelId']
         SEARCH_QUERY[item['snippet']['title']]['description'] = item['snippet']['description']
         SEARCH_QUERY[item['snippet']['title']]['thumbnail'] = item['snippet']['thumbnails']['high']['url']
-    __folders()
+    __folders('search')
 
 
 
@@ -303,7 +343,7 @@ def __render():
         l_count += 1
         if LOCAL_CONF['update'] == False:
             PDIALOG.update(int(100 * l_count / len(VIDEOS)), data['title'] )
-        Path(CHANNELS+'\\'+re.sub(r'[^\w\s]', '', data['author'])+'\\'+str(data['season'])).mkdir(parents=True, exist_ok=True)
+        xbmcvfs.mkdirs(CHANNELS+'\\'+re.sub(r'[^\w\s]', '', data['author'])+'\\'+str(data['season']))
         output = """
 <episodedetails>
     <title>{title}</title>
@@ -343,34 +383,116 @@ def __refresh():
         VIDEOS.clear()
         VIDEO_DURATION.clear()
         LOCAL_CONF['update'] = True
-        if 'last_page' in CONFIG['channels'][items]:
-            __parse_uploads(CONFIG['channels'][items]['playlist_id'],CONFIG['channels'][items]['last_page'],update=True)
-        else:
-            __parse_uploads(CONFIG['channels'][items]['playlist_id'],None, update=True)
+        __parse_uploads(False,CONFIG['channels'][items]['playlist_id'],None, update=True)
     CONFIG['last_scan'] = int(time.time())
     __save()
     xbmcgui.Dialog().notification(addonname, 'Update finished', xbmcgui.NOTIFICATION_INFO, 5000)
 
 
-
-
 def __folders(*args):
-    for items in SEARCH_QUERY:
-        xbmc.log(str(items))
-        li = xbmcgui.ListItem(items)
-        info = {'plot': SEARCH_QUERY[items]['description']}
-        li.setInfo('video', info)
-        li.setArt({'thumb': SEARCH_QUERY[items]['thumbnail']})
-        url = __build_url({'mode': 'AddItem', 'foldername': SEARCH_QUERY[items]['id'] })
+    if 'search' in args:
+        for items in SEARCH_QUERY:
+            xbmc.log(str(items))
+            li = xbmcgui.ListItem(items)
+            info = {'plot': SEARCH_QUERY[items]['description']}
+            li.setInfo('video', info)
+            li.setArt({'thumb': SEARCH_QUERY[items]['thumbnail']})
+            url = __build_url({'mode': 'AddItem', 'foldername': SEARCH_QUERY[items]['id'] })
+            xbmcplugin.addDirectoryItem(handle=addon_handle, url=url, listitem=li, isFolder=True)
+    elif 'Manage' in args:
+        for items in CONFIG['channels']:
+            plot = ""
+            thumb = addon_resources+'/media/youtube_logo.jpg'
+            if 'branding' in CONFIG['channels'][items]:
+                thumb = CONFIG['channels'][items]['branding']['thumbnail']
+                plot = CONFIG['channels'][items]['branding']['description']
+                fanart = CONFIG['channels'][items]['branding']['fanart']
+                banner = CONFIG['channels'][items]['branding']['banner']
+            li = xbmcgui.ListItem(CONFIG['channels'][items]['channel_name'])
+            info = {'plot': plot}
+            li.setInfo('video', info)
+            li.setArt({'thumb': thumb})
+            li.addContextMenuItems([('Rescan', ''),('Remove','')])
+            url = __build_url({'mode': 'C_MENU', 'foldername': items })
+            xbmcplugin.addDirectoryItem(handle=addon_handle, url=url, listitem=li, isFolder=True)
+
+    elif 'menu' in args:
+        menuItems = {'Add Channel':'Add channels', 'Manage':'Manage channelino','Refresh all':'Refresh challeino'}
+        for items in menuItems:
+            pass
+            ezy=items.replace(' ','_')
+            thumb = addon_resources+'/media/buttons/'+ezy+'.png'
+            li = xbmcgui.ListItem(items)
+            info = {'plot': menuItems[items]}
+            li.setInfo('video', info)
+            li.setArt({'thumb': thumb})
+            #li.addContextMenuItems([('Rescan', ''),('Remove','')])
+            url = __build_url({'mode': 'ManageItem', 'foldername': ezy })
+            xbmcplugin.addDirectoryItem(handle=addon_handle, url=url, listitem=li, isFolder=True)
+#SEPARATOR
+        thumb = addon_resources+'/media/buttons/empty.png'
+        li = xbmcgui.ListItem(' ')
+        li.setArt({'thumb': thumb})
+        li.setInfo('video', {'plot':'Oh hi there! :)'})
+        xbmcplugin.addDirectoryItem(handle=addon_handle, url='plugin://'+addonID, listitem=li, isFolder=True)
+#SEPARATOR
+        thumb = addon_resources+'/media/buttons/empty.png'
+        li = xbmcgui.ListItem(' ')
+        li.setArt({'thumb': thumb})
+        li.setInfo('video', {'plot':'Oh hi there! :)'})
+        xbmcplugin.addDirectoryItem(handle=addon_handle, url='plugin://'+addonID, listitem=li, isFolder=True)        
+#SEPARATOR
+        thumb = addon_resources+'/media/buttons/empty.png'
+        li = xbmcgui.ListItem(' ')
+        li.setArt({'thumb': thumb})
+        li.setInfo('video', {'plot':'Oh hi there! :)'})
+        xbmcplugin.addDirectoryItem(handle=addon_handle, url='plugin://'+addonID, listitem=li, isFolder=True)        
+#SEPARATOR
+        thumb = addon_resources+'/media/buttons/empty.png'
+        li = xbmcgui.ListItem(' ')
+        li.setArt({'thumb': thumb})
+        li.setInfo('video', {'plot':'Oh hi there! :)'})
+        xbmcplugin.addDirectoryItem(handle=addon_handle, url='plugin://'+addonID, listitem=li, isFolder=True)
+#SEPARATOR
+        thumb = addon_resources+'/media/buttons/empty.png'
+        li = xbmcgui.ListItem(' ')
+        li.setArt({'thumb': thumb})
+        li.setInfo('video', {'plot':'Oh hi there! :)'})
+        xbmcplugin.addDirectoryItem(handle=addon_handle, url='plugin://'+addonID, listitem=li, isFolder=True)                
+        #ADDON SETTINGS
+        thumb = addon_resources+'/media/buttons/Settings.png'
+        li = xbmcgui.ListItem('Addon Settings')
+        li.setArt({'thumb': thumb})
+        li.addContextMenuItems([('Rescan', ''),('Remove','')])
+        url = __build_url({'mode': 'OpenSettings', 'foldername': ' ' })
         xbmcplugin.addDirectoryItem(handle=addon_handle, url=url, listitem=li, isFolder=True)
+        #SEPARATOR
+#        thumb = addon_resources+'/media/buttons/empty.png'
+#        li = xbmcgui.ListItem(' ')
+#        li.setArt({'thumb': thumb})
+#        xbmcplugin.addDirectoryItem(handle=addon_handle, url='', listitem=li, isFolder=False)
+        #ADDON INFO (Next update)
+        if 'last_scan' in CONFIG:
+            now = int(time.time())
+            countdown=int(CONFIG['last_scan'] + int(xbmcaddon.Addon().getSetting('update_interval'))*3600)
+            thumb = addon_resources+'/media/buttons/Update.png'
+            li = xbmcgui.ListItem('Next scheduled update in:          ' + convert(countdown - now))
+            li.setArt({'thumb': thumb})
+            li.addContextMenuItems([('Rescan', ''),('Remove','')])
+            url = __build_url({'mode': 'OpenSettings', 'foldername': ' ' })
+            xbmcplugin.addDirectoryItem(handle=addon_handle, url=url, listitem=li, isFolder=False)
+
+
+
     xbmcplugin.endOfDirectory(addon_handle)
-    
+
 def __logger(a):
     xbmc.log(str(a),level=xbmc.LOGNOTICE)
 
 def __menu(*args):
-    menuItems = ['Add Channel', 'List Channels','Refresh']
+    menuItems = ['Add Channel', 'Manage','Refresh all']
     if args:
+        xbmcplugin.endOfDirectory(addon_handle)
         menuItems=(args[0])
     dialog = xbmcgui.Dialog()
     ret = dialog.select(addonname, menuItems)
@@ -382,22 +504,68 @@ def __menu(*args):
         if query:
             LOCAL_CONF['update'] = False
             __search(query)
-    elif menuItems[ret] == 'List Channels':
-        __folders()
-    elif menuItems[ret] == 'Refresh':
+    elif menuItems[ret] == 'Manage':
+        __folders('list')
+    elif menuItems[ret] == 'Refresh all':
         LOCAL_CONF['update'] = False
         __refresh()
 
 
 
+def __C_MENU(C_ID):
+    menuItems=['Refresh','Delete']
+    ret = xbmcgui.Dialog().select('Manage: '+CONFIG['channels'][C_ID]['channel_name'], menuItems)
+    if menuItems[ret] == 'Refresh':
+        __add_channel(C_ID)
+    elif menuItems[ret] == 'Delete':
+        cname=CONFIG['channels'][C_ID]['channel_name']
+        cdir = CHANNELS+'\\'+re.sub(r'[^\w\s]', '', cname)
+        __logger(cdir)
+        ret = xbmcgui.Dialog().yesno('Delete: '+cname, 'Are you sure you wish to remove "'+cname+'"?')
+        if ret:
+            CONFIG['channels'].pop(C_ID)
+            __save()
+            ret = xbmcgui.Dialog().yesno('Delete: '+cname, 'Remove "'+cname+'" also from the library?')
+            if ret:
+                shutil.rmtree(cdir)
+                xbmc.executebuiltin("CleanLibrary(video)")
+                pass
+
 __start_up()
 mode = args.get('mode', None)
 
+try:
+    mode = sys.argv[2][1:].split(u'mode')[1][1:]
+except IndexError:
+    mode = None
+
+try:
+    foldername = sys.argv[2][1:].split(u'mode')[0].split(u'=')[1][:-1]
+except IndexError:
+    foldername = None
+
+
+
 if mode is None:
-    __menu()
-elif mode[0] == 'AddItem':
-    __add_channel(args['foldername'][0])
-elif mode[0] == 'Refresh':
+    __folders('menu')
+elif mode == 'AddItem':
+    __add_channel(foldername)
+elif mode == 'ManageItem':
+    if foldername == 'Add_Channel':
+        query=__ask('','Search for a channel')
+        if query:
+            LOCAL_CONF['update'] = False
+            __search(query)
+    elif foldername == 'Manage':
+        __folders('Manage')
+    elif foldername == 'Refresh_all':
+        LOCAL_CONF['update'] = False
+        __refresh()
+elif mode == 'C_MENU':
+    __C_MENU(foldername)
+elif mode == 'Refresh':
     __refresh()
+elif mode == 'OpenSettings':
+    xbmcaddon.Addon(addonID).openSettings()    
 
 
