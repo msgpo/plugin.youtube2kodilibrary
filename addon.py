@@ -14,7 +14,8 @@ import xbmcaddon
 import xbmcgui
 import xbmcplugin
 import shutil
- 
+import math
+
 addon       = xbmcaddon.Addon()
 addonname   = addon.getAddonInfo('name')
 addonID       = addon.getAddonInfo('id')
@@ -39,19 +40,31 @@ LOCAL_CONF = {'update':False}
 def __build_url(query):
     return base_url + '?' + urllib.parse.urlencode(query)
 
-def convert(n): 
-    return str(datetime.timedelta(seconds = n)) 
+def convert(n,*args):
+    if 'text' in args:
+        returntime = time.strftime('%H %M', time.gmtime(n)).split(' ')
+        if returntime[0] == '00':
+            return returntime[1] + ' Minutes'
+        return  returntime[0] + ' Hours ' + returntime[1] + ' Minutes'
+    return str(time.strftime('%H:%M:%S', time.gmtime(n))) 
+
+def __get_token_reset():
+    now = datetime.datetime.utcnow() - datetime.timedelta(hours=7)
+    reset = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+    seconds = (reset - now).seconds
+    return seconds
 
 CONFIG={}
-config_file=addon_path+'\\config.json'
-if xbmcvfs.exists(config_file):
-    with open(config_file, 'r') as f:
-        CONFIG = json.load(f)
+config_file=addon_path+'\\config.json'       # 
+if xbmcvfs.exists(config_file):              #\ PYTHON 3
+    with xbmcvfs.File(config_file) as f:     #/ v19+
+        CONFIG = json.load(f)                #
 else:
     CONFIG = {}
     CONFIG['channels'] = {}
     CONFIG['movies'] = {}
     CONFIG['music_videos'] = {}
+
 
 def __save():
     with open(addon_path+'//config.json', mode='w', encoding='UTF-8', errors='strict', buffering=1) as file:
@@ -75,8 +88,6 @@ def __ask(name, *args):
     kb.doModal()
     return(kb.getText())
   
-
-
 def __check_key_validity(key):
     req = requests.get("https://www.googleapis.com/youtube/v3/channels?part=snippet&id=UCS5tt2z_DFvG7-39J3aE-bQ&key="+key)
     if req.status_code == 200:
@@ -84,13 +95,51 @@ def __check_key_validity(key):
     return 'invalid'
 
 
+#if cache then cache, else use live...
+def c_download(req):
+    url = req.replace("&key="+addon.getSetting('API_key'),'').split('?')
+    url[1] = url[1]
+    handle=url[0].split('/')[-1]
+    cache_file=addon_path + '/cache/' + handle + '/' + url[1]
+    if addon.getSetting('use_cache') == 'true':
+        xbmcvfs.mkdirs(addon_path + '/cache/' + handle +'/')
+        if xbmcvfs.exists(cache_file[:250]):
+            with open(cache_file[:250], 'r') as f:
+                return json.load(f)
+        else:
+            requrl = requests.get(req)
+            reply = json.loads(requrl.content)
+            with open(cache_file[:250], mode='w', encoding='UTF-8', errors='strict', buffering=1) as file:
+                file.write(json.dumps(reply))
+                file.close()            
+            return reply
+    else:
+        requrl = requests.get(req)
+        reply = json.loads(requrl.content)
+        return reply
+
+
+
+
 def __add_channel(channel_id,refresh=None):
     data = {}
     channel_url = "https://www.googleapis.com/youtube/v3/channels?part=brandingSettings,contentDetails,contentOwnerDetails,id,localizations,snippet,statistics,status,topicDetails&id="+channel_id+"&key="+addon.getSetting('API_key')
-    req = requests.get(channel_url)
-    reply = json.loads(req.content)
+    reply = c_download(channel_url)
+    try:
+        if 'error' in reply:
+            e_reason=reply['error']['errors'][0]['reason']
+            e_message=reply['error']['errors'][0]['message']
+            if e_reason == 'quotaExceeded':
+                e_message = "The request cannot be completed because you have exceeded your quota."
+            xbmcgui.Dialog().notification(addonname, e_message, addon_resources+'/icon.png', 10000)
+            __logger(e_message)
+            if len(VIDEOS) >= 1:
+                __render()
+            raise SystemExit(" error: quota exceeded")
+    except NameError:
+        pass    
     if 'items' not in reply:
-        raise SystemExit("no such channel")
+        return "no such channel"
     data['channel_id'] = channel_id
     data['title'] = reply['items'][0]['brandingSettings']['channel']['title']
     if 'description' in reply['items'][0]['brandingSettings']['channel']:
@@ -98,9 +147,15 @@ def __add_channel(channel_id,refresh=None):
     else:
         data['plot'] = data['title']
     data['aired'] = reply['items'][0]['snippet']['publishedAt']
-    data['thumb'] = reply['items'][0]['snippet']['thumbnails']['high']['url']
+    if 'high' in reply['items'][0]['snippet']['thumbnails']:
+        data['thumb'] = reply['items'][0]['snippet']['thumbnails']['high']['url']
+    else:
+        data['thumb'] = reply['items'][0]['snippet']['thumbnails']['default']['url']
     data['banner'] = reply['items'][0]['brandingSettings']['image']['bannerImageUrl']
-    data['fanart'] = reply['items'][0]['brandingSettings']['image']['bannerTvHighImageUrl']
+    if 'bannerTvHighImageUrl' in reply['items'][0]['brandingSettings']['image']:
+        data['fanart'] = reply['items'][0]['brandingSettings']['image']['bannerTvHighImageUrl']
+    else:
+        data['fanart'] = reply['items'][0]['brandingSettings']['image']['bannerImageUrl']
     uploads = reply['items'][0]['contentDetails']['relatedPlaylists']['uploads']
     data['uploader_stripped'] = re.sub(r'[^\w\s]', '', data['title']).replace(" ", "_")
     xbmcvfs.mkdirs(CHANNELS+'\\'+re.sub(r'[^\w\s]', '', data['title']))
@@ -140,67 +195,99 @@ def __add_channel(channel_id,refresh=None):
     __save()
     __parse_uploads(True,uploads,None)
 
+
+PARSER = {'items' : 0,'total' : 0,'total_steps':0,'steps':0,'scan_year' : 0}
 def __parse_uploads(fullscan, playlist_id, page_token=None, update=False):
-    if page_token and fullscan:
+    __logger('Getting info for playlist: ' + playlist_id)
+    url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId="+playlist_id+"&key="+addon.getSetting('API_key')
+    reply = c_download(url)
+    last_video_id='Nevergonnagiveyouup'
+    while True:
+        reply = c_download(url)
+        vid = []
+        try:
+            if 'error' in reply:
+                e_reason=reply['error']['errors'][0]['reason']
+                e_message=reply['error']['errors'][0]['message']
+                if e_reason == 'quotaExceeded':
+                    e_message = "The request cannot be completed because you have exceeded your quota."
+                xbmcgui.Dialog().notification(addonname, e_message, addon_resources+'/media/notify/error.png', 10000)
+                __logger(e_message)
+                if len(VIDEOS) >= 1:
+                    __render()
+                break
+        except NameError:
+            pass
+        totalResults=int(reply['pageInfo']['totalResults'])
+        if addon.getSetting('toggle_import_limit') == 'true':
+            totalResults = min(int(reply['pageInfo']['totalResults']),int(addon.getSetting('import_limit')))
+        if (PARSER['total_steps'] == 0):
+            PARSER['total_steps'] = int(totalResults * 4)
+        PARSER['total'] = totalResults
+        if PARSER['steps'] < 1 and LOCAL_CONF['update'] == False:
+            PDIALOG.create('Fetching channel info', 'Please wait...')
+        try:
+            if 'last_video' in CONFIG['channels'][reply['items'][0]['snippet']['channelId']]:
+                last_video_id = CONFIG['channels'][reply['items'][0]['snippet']['channelId']]['last_video']['video_id']
+        except KeyError:
+            pass
+            __logger('no previous scan found')
+        for item in reply['items']:
+            if LOCAL_CONF['update'] == False and PDIALOG.iscanceled(): 
+                return
+            season = int(item['snippet']['publishedAt'].split('T')[0].split('-')[0])                
+            VIDEOS.append(item)
+            PARSER['items'] += 1
+            PARSER['steps'] += 1
+            if item['snippet']['resourceId']['videoId'] == last_video_id:
+                break
+            vid.append(item['snippet']['resourceId']['videoId'])
+            if LOCAL_CONF['update'] == False:
+                PDIALOG.update(int(100 * PARSER['steps'] / PARSER['total_steps']), 'Downloading info: ' + str(PARSER['items']) + '/' + str(PARSER['total']) \
+                    + '\nYEAR '+ str(season))
+
+        __get_video_details(vid)
+        if 'nextPageToken' not in reply or not fullscan or PARSER['items'] >= PARSER['total']:
+            break
+        page_token = reply['nextPageToken']
         url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId="+playlist_id+"&pageToken="+page_token+"&key="+addon.getSetting('API_key')
-    else:
-        url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId="+playlist_id+"&key="+addon.getSetting('API_key')
-    req = requests.get(url)
-    reply = json.loads(req.content)
-    vid = []
-    try:
-        if 'error' in reply:
-            e_reason=reply['error']['errors'][0]['reason']
-            e_message=reply['error']['errors'][0]['message']
-            if e_reason == 'quotaExceeded':
-                e_message = "The request cannot be completed because you have exceeded your quota."
-            xbmcgui.Dialog().notification(addonname, e_message, xbmcgui.NOTIFICATION_ERROR, 10000)
-            __logger(e_message)
-            if len(VIDEOS) >= 1:
-                __render()
-            raise SystemExit(" error: quota exceeded")
-    except NameError:
-        pass
-    totalResults=int(reply['pageInfo']['totalResults'])
-    if LOCAL_CONF['update'] == False:
-        PDIALOG.create('Fetching channel info', 'Please wait...')        
-    for item in reply['items']:
-        VIDEOS.append(item)
-        if LOCAL_CONF['update'] == False:
-            PDIALOG.update(int(100 * len(VIDEOS) / totalResults), 'Downloading info: ' + str(len(VIDEOS)) + '/' + str(totalResults) )
-        vid.append(item['snippet']['resourceId']['videoId'])
-    __get_video_details(vid)
-    if reply.get('nextPageToken') and fullscan:
-        CONFIG['channels'][reply['items'][0]['snippet']['channelId']]['last_page'] = reply['nextPageToken']
-        __parse_uploads(True, playlist_id, reply['nextPageToken'])
-    else:
-        __render()
+
+        #if reply.get('nextPageToken') and fullscan:
+        #    CONFIG['channels'][reply['items'][0]['snippet']['channelId']]['last_page'] = reply['nextPageToken']
+        #    __parse_uploads(True, playlist_id, reply['nextPageToken'])
+    if len(VIDEOS) > 0:
+        __render()    
+
+
+
 
 
 def __get_video_details(array):
-    get = ','.join(array)
-    url = "https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id="+get+"&key="+addon.getSetting('API_key')
-    req = requests.get(url)
-    reply = json.loads(req.content)
-    try:
-        if 'error' in reply:
-            e_reason=reply['error']['errors'][0]['reason']
-            e_message=reply['error']['errors'][0]['message']
-            if e_reason == 'quotaExceeded':
-                e_message = "The request cannot be completed because you have exceeded your quota."
-            xbmcgui.Dialog().notification(addonname, e_message, xbmcgui.NOTIFICATION_ERROR, 10000)
-            __logger(e_message)
-            if len(VIDEOS) >= 1:
-                __render()
-            raise SystemExit(" error: quota exceeded")
-    except NameError:
-        pass    
-    for item in reply['items']:
-        VIDEO_DURATION[item['id']] = __yt_duration(item['contentDetails']['duration'])
-
+    x = [array[i:i + 50] for i in range(0, len(array), 50)]
+    for stacks in x:
+        get = ','.join(stacks)
+        url = "https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id="+get+"&key="+addon.getSetting('API_key')
+        reply = c_download(url)
+        try:
+            if 'error' in reply:
+                e_reason=reply['error']['errors'][0]['reason']
+                e_message=reply['error']['errors'][0]['message']
+                if e_reason == 'quotaExceeded':
+                    e_message = "The request cannot be completed because you have exceeded your quota."
+                xbmcgui.Dialog().notification(addonname, e_message, addon_resources+'/icon.png', 10000)
+                __logger(e_message)
+                if len(VIDEOS) >= 1:
+                    __render()
+                raise SystemExit(" error: quota exceeded")
+        except NameError:
+            pass    
+        for item in reply['items']:
+            #stick = { item['id'] : __yt_duration(item['contentDetails']['duration']) }
+            VIDEO_DURATION[item['id']] = __yt_duration(item['contentDetails']['duration'])
+            PARSER['steps'] += 1
 
 def __yt_duration(in_time):
-    duration = 0
+    duration = 1
     time = in_time.split("PT")[1]
     if 'H' in time and 'M' in time and 'S' in time:
         duration = int(time.split("H")[0])*60 + int(time.split("H")[1].split("M")[0])
@@ -210,16 +297,14 @@ def __yt_duration(in_time):
         duration = int(time.split("H")[0])*60
     elif 'M' in time and 'S' in time:
         duration = int(time.split("M")[0])
-    else:
-        duration = 0
-    return duration
+    return str(duration)
 
 
 def __check_if_youtube_addon_has_api_key():
     try:
         yt_api_key = xbmcaddon.Addon('plugin.video.youtube').getSetting('youtube.api.key')
         if yt_api_key:
-            ret = xbmcgui.Dialog().yesno(addonname, u'would you like to use the same API key you have set on YouTube addon?')
+            ret = xbmcgui.Dialog().yesno(addonname, 'would you like to use the same API key you have set on YouTube addon?')
             if ret:
                 return yt_api_key
     except RuntimeError:
@@ -248,6 +333,8 @@ for instructions see: https://developers.google.com/youtube/v3/getting-started
         else:
             __print('Nothing given')
             raise SystemExit
+    newlimit = int(math.ceil(int(addon.getSetting('import_limit')) / 100.0)) * 100
+    addon.setSetting('import_limit',str(newlimit))
     
 
 
@@ -257,14 +344,15 @@ SEARCH_QUERY={}
 def __search(query):
     SEARCH_QUERY.clear()
     channel_url = "https://www.googleapis.com/youtube/v3/search?type=channel&part=id,snippet&maxResults=50&q="+query+"&key="+addon.getSetting('API_key')
-    req = requests.get(channel_url)
-    reply = json.loads(req.content)
+    #req = requests.get(channel_url)
+    #reply = json.loads(req.content)
+    reply = c_download(channel_url)
     try:
         if 'error' in reply:
             e_reason=reply['error']['errors'][0]['reason']
             e_message=reply['error']['errors'][0]['message']
             if e_reason == 'quotaExceeded':
-                e_message = "The request cannot be completed because you have exceeded your quota."
+                e_message = "The request cannot be completed because you have exceeded your quota.Quota resets in :\n\n"+ convert(__get_token_reset(),'text')
             __print(e_message)
             raise SystemExit(" error")
     except NameError:
@@ -280,7 +368,6 @@ def __search(query):
     SEARCH_QUERY[reply['items'][0]['snippet']['title']+' ']['description'] = reply['items'][0]['snippet']['description']
     SEARCH_QUERY[reply['items'][0]['snippet']['title']+' ']['thumbnail'] = reply['items'][0]['snippet']['thumbnails']['high']['url']
     for item in reply['items']:
-        xbmc.log(str(item))
         SEARCH_QUERY[item['snippet']['title']] = {}
         SEARCH_QUERY[item['snippet']['title']]['id'] = item['snippet']['channelId']
         SEARCH_QUERY[item['snippet']['title']]['description'] = item['snippet']['description']
@@ -290,22 +377,21 @@ def __search(query):
 
 
 
-
-def __render():
+def __render(render_style='Full'):
     if len(VIDEOS) <= 0:
-        raise SystemExit()
+        return
     if LOCAL_CONF['update'] == False:
         PDIALOG.create('Importing channel', 'Please wait...')
     year = 0
     episode = 0
-    VIDEOS.reverse()
     l_count=0
     channelId=VIDEOS[0]['snippet']['channelId']
+    VIDEOS.reverse()
     if 'last_video' in CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]:
-        year = int(CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['season'])
-        episode = int(CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['episode'])
-        latest_aired = int(CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['aired'])
-        last_video_id = CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['video_id']
+            year = int(CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['season'])
+            episode = int(CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['episode'])
+            latest_aired = int(CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['aired'])
+            last_video_id = CONFIG['channels'][VIDEOS[0]['snippet']['channelId']]['last_video']['video_id']
     for item in VIDEOS:
         data = {}
         data['video_id'] = item['snippet']['resourceId']['videoId']
@@ -316,8 +402,10 @@ def __render():
         aired_timestamp = int((aired_datetime - datetime.datetime(1970,1,1)).total_seconds())
         try:
             if latest_aired > aired_timestamp or last_video_id == data['video_id']:
+                PARSER['steps'] += 2
                 continue
         except NameError:
+            __logger('name error')
             pass
         data['author'] = item['snippet']['channelTitle']
         data['channelId'] = item['snippet']['channelId']
@@ -342,7 +430,7 @@ def __render():
         data['season'] = season
         l_count += 1
         if LOCAL_CONF['update'] == False:
-            PDIALOG.update(int(100 * l_count / len(VIDEOS)), data['title'] )
+            PDIALOG.update(int(100 * PARSER['steps'] / PARSER['total_steps']), data['title'] )
         xbmcvfs.mkdirs(CHANNELS+'\\'+re.sub(r'[^\w\s]', '', data['author'])+'\\'+str(data['season']))
         output = """
 <episodedetails>
@@ -355,10 +443,10 @@ def __render():
     <credits>{author}</credits>
     <director>{author}</director>
     <thumb>{thumb}</thumb>
-    <runtime>{video_duration}</runtime>
+    <runtime>video_duration</runtime>
     <fileinfo>
         <streamdetails>
-        <durationinseconds>{video_duration}</durationinseconds>
+        <durationinseconds>video_duration</durationinseconds>
         </streamdetails>
     </fileinfo>
 </episodedetails>
@@ -368,17 +456,25 @@ def __render():
         file = open(write_file, 'w', encoding="utf-8")
         file.write(output)
         file.close()
+        PARSER['steps'] += 1
+        if LOCAL_CONF['update'] == False:
+            PDIALOG.update(int(100 * PARSER['steps'] / PARSER['total_steps']), data['title'] )        
         write_file = file_location+'.strm'
         file = open(write_file, 'w', encoding="utf-8")
         file.write('plugin://plugin.video.youtube/play/?video_id='+data['video_id'])
         file.close()
+        PARSER['steps'] += 1
+        if LOCAL_CONF['update'] == False:
+            PDIALOG.update(int(100 * PARSER['steps'] / PARSER['total_steps']), data['title'] )        
         CONFIG['channels'][data['channelId']]['last_video'] = {'video_id' : data['video_id'], 'aired' : aired_timestamp , 'season' : str(data['season']) , 'episode' : str(data['episode']) }
         __save()
-        xbmc.executebuiltin("UpdateLibrary(video)")
+        if addon.getSetting('refresh_after_add') == 'true':
+            time.sleep(1)
+            xbmc.executebuiltin("UpdateLibrary(video)")
 
 
 def __refresh():
-    xbmcgui.Dialog().notification(addonname, 'Updating channels', xbmcgui.NOTIFICATION_INFO, 5000)
+    xbmcgui.Dialog().notification(addonname, 'Updating channels', addon_resources+'/icon.png', 5000)
     for items in CONFIG['channels']:
         VIDEOS.clear()
         VIDEO_DURATION.clear()
@@ -386,7 +482,7 @@ def __refresh():
         __parse_uploads(False,CONFIG['channels'][items]['playlist_id'],None, update=True)
     CONFIG['last_scan'] = int(time.time())
     __save()
-    xbmcgui.Dialog().notification(addonname, 'Update finished', xbmcgui.NOTIFICATION_INFO, 5000)
+    xbmcgui.Dialog().notification(addonname, 'Update finished', addon_resources+'/icon.png', 5000)
 
 
 def __folders(*args):
@@ -452,12 +548,6 @@ def __folders(*args):
         li = xbmcgui.ListItem(' ')
         li.setArt({'thumb': thumb})
         li.setInfo('video', {'plot':'Oh hi there! :)'})
-        xbmcplugin.addDirectoryItem(handle=addon_handle, url='plugin://'+addonID, listitem=li, isFolder=True)
-#SEPARATOR
-        thumb = addon_resources+'/media/buttons/empty.png'
-        li = xbmcgui.ListItem(' ')
-        li.setArt({'thumb': thumb})
-        li.setInfo('video', {'plot':'Oh hi there! :)'})
         xbmcplugin.addDirectoryItem(handle=addon_handle, url='plugin://'+addonID, listitem=li, isFolder=True)                
         #ADDON SETTINGS
         thumb = addon_resources+'/media/buttons/Settings.png'
@@ -466,11 +556,6 @@ def __folders(*args):
         li.addContextMenuItems([('Rescan', ''),('Remove','')])
         url = __build_url({'mode': 'OpenSettings', 'foldername': ' ' })
         xbmcplugin.addDirectoryItem(handle=addon_handle, url=url, listitem=li, isFolder=True)
-        #SEPARATOR
-#        thumb = addon_resources+'/media/buttons/empty.png'
-#        li = xbmcgui.ListItem(' ')
-#        li.setArt({'thumb': thumb})
-#        xbmcplugin.addDirectoryItem(handle=addon_handle, url='', listitem=li, isFolder=False)
         #ADDON INFO (Next update)
         if 'last_scan' in CONFIG:
             now = int(time.time())
@@ -478,11 +563,11 @@ def __folders(*args):
             thumb = addon_resources+'/media/buttons/Update.png'
             li = xbmcgui.ListItem('Next scheduled update in:          ' + convert(countdown - now))
             li.setArt({'thumb': thumb})
+            li.setInfo('video', {'plot': 'Time until token resets: \n' + convert(__get_token_reset(),'text') })
             li.addContextMenuItems([('Rescan', ''),('Remove','')])
             url = __build_url({'mode': 'OpenSettings', 'foldername': ' ' })
             xbmcplugin.addDirectoryItem(handle=addon_handle, url=url, listitem=li, isFolder=False)
-
-
+            now = int(time.time())
 
     xbmcplugin.endOfDirectory(addon_handle)
 
@@ -530,7 +615,6 @@ def __C_MENU(C_ID):
                 shutil.rmtree(cdir)
                 xbmc.executebuiltin("CleanLibrary(video)")
                 pass
-
 __start_up()
 mode = args.get('mode', None)
 
